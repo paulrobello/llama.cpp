@@ -52,7 +52,7 @@
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
 
 #define WEBGPU_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG    4
-#define WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG 8
+#define WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG 4
 #define WEBGPU_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG      4
 
 // default size for reg-tile matrix multiplication
