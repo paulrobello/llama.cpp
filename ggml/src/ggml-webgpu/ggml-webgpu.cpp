@@ -190,6 +190,7 @@ struct webgpu_tensor_get_async_request {
     size_t       size       = 0;
     size_t       final_size = 0;
     std::atomic<int32_t> state = 0; // 0=queue, 1=map, 2=ready, -1=error, -2=cancelled
+    std::atomic<bool>    mapped = false;
     wgpu::QueueWorkDoneStatus queue_status = wgpu::QueueWorkDoneStatus::Success;
     std::string               queue_message;
     wgpu::MapAsyncStatus      map_status = wgpu::MapAsyncStatus::Success;
@@ -197,7 +198,7 @@ struct webgpu_tensor_get_async_request {
 
     void cleanup() {
         if (staging_buf) {
-            if (state.load() == 2) {
+            if (mapped.exchange(false)) {
                 staging_buf.Unmap();
             }
             staging_buf.Destroy();
@@ -804,6 +805,11 @@ static const char * ggml_backend_webgpu_name(ggml_backend_t backend) {
 static void ggml_backend_webgpu_free(ggml_backend_t backend) {
     ggml_backend_webgpu_context * ctx = (ggml_backend_webgpu_context *) backend->context;
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_free(" << ctx->name << ")");
+
+    {
+        std::lock_guard<std::mutex> lock(g_webgpu_async_get_tensor_mutex);
+        g_webgpu_async_get_tensor_requests.clear();
+    }
 
 #ifdef GGML_WEBGPU_CPU_PROFILE
     std::cout << "\n[ggml_webgpu cpu profiling summary]\n";
@@ -3825,12 +3831,21 @@ static std::shared_ptr<webgpu_tensor_get_async_request> ggml_backend_webgpu_begi
             request->staging_buf.MapAsync(
                 wgpu::MapMode::Read, 0, request->final_size, wgpu::CallbackMode::AllowSpontaneous,
                 [request](wgpu::MapAsyncStatus map_status, wgpu::StringView map_message) {
-                    if (request->state.load() == -2) {
-                        return;
-                    }
                     request->map_status = map_status;
                     request->map_message = std::string(map_message);
-                    request->state.store(map_status == wgpu::MapAsyncStatus::Success ? 2 : -1);
+                    if (request->state.load() == -2) {
+                        if (map_status == wgpu::MapAsyncStatus::Success) {
+                            request->mapped.store(true);
+                            request->cleanup();
+                        }
+                        return;
+                    }
+                    if (map_status == wgpu::MapAsyncStatus::Success) {
+                        request->mapped.store(true);
+                        request->state.store(2);
+                    } else {
+                        request->state.store(-1);
+                    }
                 });
         });
 
@@ -3918,7 +3933,9 @@ extern "C" void ggml_backend_webgpu_tensor_get_async_cancel(int32_t request_id) 
     }
 
     request->state.store(-2);
-    request->cleanup();
+    if (request->mapped.load()) {
+        request->cleanup();
+    }
 }
 
 static void ggml_backend_webgpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
