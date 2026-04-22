@@ -189,6 +189,7 @@ struct webgpu_tensor_get_async_request {
     wgpu::Buffer staging_buf;
     size_t       size       = 0;
     size_t       final_size = 0;
+    std::atomic<int32_t> request_id = 0;
     std::atomic<int32_t> state = 0; // 0=queue, 1=map, 2=ready, -1=error, -2=cancelled
     std::atomic<bool>    mapped = false;
     wgpu::QueueWorkDoneStatus queue_status = wgpu::QueueWorkDoneStatus::Success;
@@ -214,6 +215,15 @@ struct webgpu_tensor_get_async_request {
 static std::mutex g_webgpu_async_get_tensor_mutex;
 static int32_t g_webgpu_async_get_tensor_next_request_id = 1;
 static std::unordered_map<int32_t, std::shared_ptr<webgpu_tensor_get_async_request>> g_webgpu_async_get_tensor_requests;
+
+#ifdef __EMSCRIPTEN__
+EM_JS(void, ggml_webgpu_notify_async_tensor_get, (int32_t request_id, int32_t state), {
+    Module.__webllmNotifyAsyncTensorGet?.(request_id, state);
+})
+#else
+static void ggml_webgpu_notify_async_tensor_get(int32_t, int32_t) {
+}
+#endif
 
 // Stores global webgpu members
 struct webgpu_global_context_struct {
@@ -3792,7 +3802,8 @@ static std::shared_ptr<webgpu_tensor_get_async_request> ggml_backend_webgpu_begi
     ggml_backend_webgpu_buffer_context * buf_ctx,
     const ggml_tensor *                  tensor,
     size_t                               offset,
-    size_t                               size) {
+    size_t                               size,
+    int32_t                              request_id) {
     wgpu::Device device = buf_ctx->global_ctx->device;
     const size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
@@ -3804,6 +3815,7 @@ static std::shared_ptr<webgpu_tensor_get_async_request> ggml_backend_webgpu_begi
     auto request = std::make_shared<webgpu_tensor_get_async_request>();
     request->size = size;
     request->final_size = final_size;
+    request->request_id.store(request_id);
     ggml_webgpu_create_buffer(device, request->staging_buf, final_size,
                               wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
                               "get_tensor_async_staging_buf");
@@ -3824,6 +3836,7 @@ static std::shared_ptr<webgpu_tensor_get_async_request> ggml_backend_webgpu_begi
             request->queue_message = std::string(message);
             if (status != wgpu::QueueWorkDoneStatus::Success) {
                 request->state.store(-1);
+                ggml_webgpu_notify_async_tensor_get(request->request_id.load(), -1);
                 return;
             }
 
@@ -3843,8 +3856,10 @@ static std::shared_ptr<webgpu_tensor_get_async_request> ggml_backend_webgpu_begi
                     if (map_status == wgpu::MapAsyncStatus::Success) {
                         request->mapped.store(true);
                         request->state.store(2);
+                        ggml_webgpu_notify_async_tensor_get(request->request_id.load(), 2);
                     } else {
                         request->state.store(-1);
+                        ggml_webgpu_notify_async_tensor_get(request->request_id.load(), -1);
                     }
                 });
         });
@@ -3862,10 +3877,9 @@ extern "C" int32_t ggml_backend_webgpu_tensor_get_async_begin(
     auto * buf_ctx = static_cast<ggml_backend_webgpu_buffer_context *>(tensor->buffer->context);
     GGML_ASSERT(buf_ctx != nullptr);
 
-    auto request = ggml_backend_webgpu_begin_tensor_get_request(buf_ctx, tensor, offset, size);
-
     std::lock_guard<std::mutex> lock(g_webgpu_async_get_tensor_mutex);
     const int32_t request_id = g_webgpu_async_get_tensor_next_request_id++;
+    auto request = ggml_backend_webgpu_begin_tensor_get_request(buf_ctx, tensor, offset, size, request_id);
     g_webgpu_async_get_tensor_requests[request_id] = std::move(request);
     return request_id;
 }
