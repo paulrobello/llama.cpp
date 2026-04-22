@@ -17,6 +17,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #ifdef GGML_WEBGPU_GPU_PROFILE
@@ -174,6 +175,7 @@ struct webgpu_capabilities {
     bool         supports_subgroups       = false;
     bool         supports_subgroup_matrix = false;
     bool         supports_dot_product     = false;
+    bool         supports_timestamp_query = false;
 
     uint32_t sg_mat_m = 0;
     uint32_t sg_mat_n = 0;
@@ -215,6 +217,41 @@ struct webgpu_tensor_get_async_request {
 static std::mutex g_webgpu_async_get_tensor_mutex;
 static int32_t g_webgpu_async_get_tensor_next_request_id = 1;
 static std::unordered_map<int32_t, std::shared_ptr<webgpu_tensor_get_async_request>> g_webgpu_async_get_tensor_requests;
+
+struct ggml_webgpu_last_graph_profile {
+    bool    valid               = false;
+    bool    breakdown_available = false;
+    double  total_ms            = 0.0;
+    double  matmul_ms           = 0.0;
+    double  attention_ms        = 0.0;
+    double  encode_overhead_ms  = 0.0;
+    int32_t dispatch_count      = 0;
+};
+
+static std::mutex g_webgpu_last_graph_profile_mutex;
+static ggml_webgpu_last_graph_profile g_webgpu_last_graph_profile;
+static std::atomic<bool> g_webgpu_graph_profiling_enabled = false;
+
+static void ggml_webgpu_set_last_graph_profile(const ggml_webgpu_last_graph_profile & profile) {
+    std::lock_guard<std::mutex> lock(g_webgpu_last_graph_profile_mutex);
+    g_webgpu_last_graph_profile = profile;
+}
+
+static ggml_webgpu_last_graph_profile ggml_webgpu_get_last_graph_profile() {
+    std::lock_guard<std::mutex> lock(g_webgpu_last_graph_profile_mutex);
+    return g_webgpu_last_graph_profile;
+}
+
+static bool ggml_webgpu_pipeline_is_matmul(const std::string & pipeline_name) {
+    return pipeline_name.find("mul_mat") != std::string::npos;
+}
+
+static bool ggml_webgpu_pipeline_is_attention(const std::string & pipeline_name) {
+    return pipeline_name.find("flash_attn") != std::string::npos ||
+           pipeline_name.find("soft_max") != std::string::npos ||
+           pipeline_name.find("diag_mask_inf") != std::string::npos ||
+           pipeline_name.find("rope") != std::string::npos;
+}
 
 #ifdef __EMSCRIPTEN__
 EM_JS(void, ggml_webgpu_notify_async_tensor_get, (int32_t request_id, int32_t state), {
@@ -311,6 +348,7 @@ struct webgpu_context_struct {
     wgpu::Buffer                            profile_timestamp_host_buf;
     wgpu::QuerySet                          profile_timestamp_query_set;
     uint32_t                                profile_timestamp_query_count = 0;
+    bool                                    profile_timestamps_active = false;
 #endif
 
     ~webgpu_context_struct() {
@@ -703,19 +741,20 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
 
     // Phase 2: Record dispatches interleaved with deferred copies
 #ifdef GGML_WEBGPU_GPU_PROFILE
-    for (size_t i = 0; i < dispatches.size(); i++) {
-        GGML_ASSERT(ctx->profile_timestamp_query_count + 2 <= WEBGPU_MAX_PROFILE_QUERY_COUNT);
-        const uint32_t query_begin = ctx->profile_timestamp_query_count++;
-        const uint32_t query_end   = ctx->profile_timestamp_query_count++;
+    if (ctx->profile_timestamps_active && ctx->profile_timestamp_query_set) {
+        for (size_t i = 0; i < dispatches.size(); i++) {
+            GGML_ASSERT(ctx->profile_timestamp_query_count + 2 <= WEBGPU_MAX_PROFILE_QUERY_COUNT);
+            const uint32_t query_begin = ctx->profile_timestamp_query_count++;
+            const uint32_t query_end   = ctx->profile_timestamp_query_count++;
 
-        wgpu::PassTimestampWrites ts_writes   = {};
-        ts_writes.querySet                    = ctx->profile_timestamp_query_set;
-        ts_writes.beginningOfPassWriteIndex   = query_begin;
-        ts_writes.endOfPassWriteIndex         = query_end;
-        wgpu::ComputePassDescriptor pass_desc = {};
-        pass_desc.timestampWrites             = &ts_writes;
+            wgpu::PassTimestampWrites ts_writes   = {};
+            ts_writes.querySet                    = ctx->profile_timestamp_query_set;
+            ts_writes.beginningOfPassWriteIndex   = query_begin;
+            ts_writes.endOfPassWriteIndex         = query_end;
+            wgpu::ComputePassDescriptor pass_desc = {};
+            pass_desc.timestampWrites             = &ts_writes;
 
-        wgpu::ComputePassEncoder pass = ctx->active_command_encoder.BeginComputePass(&pass_desc);
+            wgpu::ComputePassEncoder pass = ctx->active_command_encoder.BeginComputePass(&pass_desc);
 
         pass.SetPipeline(dispatches[i].pipeline.pipeline);
         pass.SetBindGroup(0, bind_groups[i]);
@@ -747,7 +786,6 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
             pass.End();
         }
     }
-#endif
 
     return result;
 }
@@ -3415,7 +3453,8 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
 #ifdef GGML_WEBGPU_GPU_PROFILE
 static void ggml_backend_webgpu_collect_profile_results(webgpu_context &                 ctx,
                                                         const std::vector<std::string> & pipeline_names,
-                                                        uint32_t &                       num_inflight_batches) {
+                                                        uint32_t &                       num_inflight_batches,
+                                                        ggml_webgpu_last_graph_profile * graph_profile) {
     if (pipeline_names.empty()) {
         return;
     }
@@ -3440,6 +3479,14 @@ static void ggml_backend_webgpu_collect_profile_results(webgpu_context &        
         // WebGPU timestamps are in ns; convert to ms.
         const double elapsed_ms = double(ts_data[2 * i + 1] - ts_data[2 * i]) * 1e-6;
         ctx->shader_gpu_time_ms[pipeline_names[i]] += elapsed_ms;
+        if (graph_profile != nullptr) {
+            if (ggml_webgpu_pipeline_is_matmul(pipeline_names[i])) {
+                graph_profile->matmul_ms += elapsed_ms;
+            }
+            if (ggml_webgpu_pipeline_is_attention(pipeline_names[i])) {
+                graph_profile->attention_ms += elapsed_ms;
+            }
+        }
     }
 
     ctx->profile_timestamp_host_buf.Unmap();
@@ -3476,16 +3523,25 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
 
     WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
 
+    const auto graph_start = std::chrono::high_resolution_clock::now();
+    ggml_webgpu_last_graph_profile graph_profile = {};
+
     std::vector<webgpu_encoded_op> commands;
 
     uint32_t num_batched_kernels  = 0;
     uint32_t num_inflight_batches = 0;
+    uint32_t total_dispatch_count = 0;
     bool     contains_set_rows    = false;
     int      num_encoded_ops      = 1;
     int      node_idx             = 0;
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
+    const bool collect_gpu_profile =
+        ctx->global_ctx->capabilities.supports_timestamp_query &&
+        g_webgpu_graph_profiling_enabled.load(std::memory_order_relaxed);
     ctx->profile_timestamp_query_count = 0;
+    ctx->profile_timestamps_active     = collect_gpu_profile;
+    ctx->batch_compute_passes          = !collect_gpu_profile;
     std::vector<std::string> profile_pipeline_names;
 #endif
 
@@ -3501,9 +3557,12 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
             commands.push_back(*cmd);
             num_batched_kernels += cmd.value().num_kernels;
+            total_dispatch_count += cmd.value().num_kernels;
 #ifdef GGML_WEBGPU_GPU_PROFILE
-            profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
-                                          cmd->pipeline_names.end());
+            if (collect_gpu_profile) {
+                profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
+                                              cmd->pipeline_names.end());
+            }
 #endif
         }
 
@@ -3551,13 +3610,28 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     }
     ctx->active_command_encoder = nullptr;
 
+    graph_profile.dispatch_count = (int32_t) total_dispatch_count;
+    graph_profile.encode_overhead_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - graph_start).count();
+
 #ifdef GGML_WEBGPU_GPU_PROFILE
-    ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
+    if (collect_gpu_profile) {
+        ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches, &graph_profile);
+        graph_profile.breakdown_available = true;
+    }
+    ctx->profile_timestamps_active = false;
 #endif
 
     if (contains_set_rows) {
         ggml_backend_webgpu_check_set_rows(ctx, num_inflight_batches);
     }
+
+    ggml_backend_webgpu_wait_queue(ctx->global_ctx);
+
+    graph_profile.total_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - graph_start).count();
+    graph_profile.valid = true;
+    ggml_webgpu_set_last_graph_profile(graph_profile);
 
     WEBGPU_CPU_PROFILE_TOTAL_END(graph_compute, ctx->global_ctx);
     return GGML_STATUS_SUCCESS;
@@ -3952,6 +4026,38 @@ extern "C" void ggml_backend_webgpu_tensor_get_async_cancel(int32_t request_id) 
     }
 }
 
+extern "C" void ggml_backend_webgpu_set_graph_profiling_enabled(int32_t enabled) {
+    g_webgpu_graph_profiling_enabled.store(enabled != 0, std::memory_order_relaxed);
+}
+
+extern "C" int32_t ggml_backend_webgpu_last_graph_profile_valid() {
+    return ggml_webgpu_get_last_graph_profile().valid ? 1 : 0;
+}
+
+extern "C" int32_t ggml_backend_webgpu_last_graph_profile_breakdown_available() {
+    return ggml_webgpu_get_last_graph_profile().breakdown_available ? 1 : 0;
+}
+
+extern "C" double ggml_backend_webgpu_last_graph_profile_total_ms() {
+    return ggml_webgpu_get_last_graph_profile().total_ms;
+}
+
+extern "C" double ggml_backend_webgpu_last_graph_profile_matmul_ms() {
+    return ggml_webgpu_get_last_graph_profile().matmul_ms;
+}
+
+extern "C" double ggml_backend_webgpu_last_graph_profile_attention_ms() {
+    return ggml_webgpu_get_last_graph_profile().attention_ms;
+}
+
+extern "C" double ggml_backend_webgpu_last_graph_profile_encode_overhead_ms() {
+    return ggml_webgpu_get_last_graph_profile().encode_overhead_ms;
+}
+
+extern "C" int32_t ggml_backend_webgpu_last_graph_profile_dispatch_count() {
+    return ggml_webgpu_get_last_graph_profile().dispatch_count;
+}
+
 static void ggml_backend_webgpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_clear(" << buffer << ", " << (uint32_t) value << ")");
     WEBGPU_CPU_PROFILE_TOTAL_START(clear);
@@ -4272,7 +4378,11 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     }
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
-    required_features.push_back(wgpu::FeatureName::TimestampQuery);
+    ctx->webgpu_global_ctx->capabilities.supports_timestamp_query =
+        ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::TimestampQuery);
+    if (ctx->webgpu_global_ctx->capabilities.supports_timestamp_query) {
+        required_features.push_back(wgpu::FeatureName::TimestampQuery);
+    }
 #endif
 
     wgpu::DeviceDescriptor dev_desc;
@@ -4364,16 +4474,18 @@ static webgpu_context initialize_webgpu_context(ggml_backend_dev_t dev) {
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     webgpu_ctx->batch_compute_passes = false;
-    ggml_webgpu_create_buffer(
-        webgpu_ctx->global_ctx->device, webgpu_ctx->profile_timestamp_dev_buf, WEBGPU_TIMESTAMP_QUERY_BUF_SIZE_BYTES,
-        wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc, "profile_timestamp_dev_buf");
-    ggml_webgpu_create_buffer(webgpu_ctx->global_ctx->device, webgpu_ctx->profile_timestamp_host_buf,
-                              WEBGPU_TIMESTAMP_QUERY_BUF_SIZE_BYTES,
-                              wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead, "profile_timestamp_host_buf");
-    wgpu::QuerySetDescriptor query_set_desc = {};
-    query_set_desc.type                     = wgpu::QueryType::Timestamp;
-    query_set_desc.count                    = WEBGPU_MAX_PROFILE_QUERY_COUNT;
-    webgpu_ctx->profile_timestamp_query_set = webgpu_ctx->global_ctx->device.CreateQuerySet(&query_set_desc);
+    if (webgpu_ctx->global_ctx->capabilities.supports_timestamp_query) {
+        ggml_webgpu_create_buffer(
+            webgpu_ctx->global_ctx->device, webgpu_ctx->profile_timestamp_dev_buf, WEBGPU_TIMESTAMP_QUERY_BUF_SIZE_BYTES,
+            wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc, "profile_timestamp_dev_buf");
+        ggml_webgpu_create_buffer(webgpu_ctx->global_ctx->device, webgpu_ctx->profile_timestamp_host_buf,
+                                  WEBGPU_TIMESTAMP_QUERY_BUF_SIZE_BYTES,
+                                  wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead, "profile_timestamp_host_buf");
+        wgpu::QuerySetDescriptor query_set_desc = {};
+        query_set_desc.type                     = wgpu::QueryType::Timestamp;
+        query_set_desc.count                    = WEBGPU_MAX_PROFILE_QUERY_COUNT;
+        webgpu_ctx->profile_timestamp_query_set = webgpu_ctx->global_ctx->device.CreateQuerySet(&query_set_desc);
+    }
 #endif
 
 #ifdef GGML_WEBGPU_DEBUG
