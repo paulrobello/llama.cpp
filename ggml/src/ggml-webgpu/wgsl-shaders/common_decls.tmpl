@@ -18,11 +18,14 @@ fn load_u16_at_src(byte_offset: u32) -> u32 {
 
 fn load_u32_at_src(byte_offset: u32) -> u32 {
     let word_idx = byte_offset / 4u;
-    let shift = (byte_offset & 0x3u) * 8u;
+    let byte_in_word = byte_offset & 0x3u;
+    if (byte_in_word == 0u) {
+        return src[word_idx];
+    }
+    let shift = byte_in_word * 8u;
     let lo = src[word_idx];
     let hi = src[word_idx + 1u];
-    let shifted = (lo >> shift) | (hi << (32u - shift));
-    return select(shifted, lo, shift == 0u);
+    return (lo >> shift) | (hi << (32u - shift));
 }
 
 fn load_f16_at_src(byte_offset: u32) -> f16 {
@@ -54,11 +57,14 @@ fn load_u32_at_src0_aligned(byte_offset: u32) -> u32 {
 
 fn load_u32_at_src0(byte_offset: u32) -> u32 {
     let word_idx = byte_offset / 4u;
-    let shift = (byte_offset & 0x3u) * 8u;
+    let byte_in_word = byte_offset & 0x3u;
+    if (byte_in_word == 0u) {
+        return src0[word_idx];
+    }
+    let shift = byte_in_word * 8u;
     let lo = src0[word_idx];
     let hi = src0[word_idx + 1u];
-    let shifted = (lo >> shift) | (hi << (32u - shift));
-    return select(shifted, lo, shift == 0u);
+    return (lo >> shift) | (hi << (32u - shift));
 }
 
 fn load_f16_at_src0(byte_offset: u32) -> f16 {
