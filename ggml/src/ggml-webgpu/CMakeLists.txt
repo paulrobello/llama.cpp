@@ -54,6 +54,7 @@ if(EMSCRIPTEN)
 
     if (GGML_WEBGPU_JSPI)
         target_compile_options(ggml-webgpu PRIVATE "-fwasm-exceptions")
+        target_compile_definitions(ggml-webgpu PRIVATE GGML_WEBGPU_JSPI=1)
         target_link_options(ggml-webgpu INTERFACE "-sJSPI" "-fwasm-exceptions")
     else()
         target_compile_options(ggml-webgpu PRIVATE "-fexceptions")

@@ -554,7 +554,14 @@ static uint32_t ggml_backend_webgpu_get_command_submit_batch_size() {
 static void ggml_backend_webgpu_wait_queue(webgpu_global_context & ctx) {
     wgpu::QueueWorkDoneStatus callback_status = wgpu::QueueWorkDoneStatus::Error;
     std::string               callback_message;
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(GGML_WEBGPU_JSPI)
+    // ASYNCIFY build path: polling loop with emscripten_sleep(1).
+    // Under JSPI we fall through to the WaitAny path below — JSPI
+    // integrates natively with the wgpu future-await, so a single
+    // suspend/resume covers the GPU completion. The polling loop's
+    // emscripten_sleep(1) under JSPI was dominating decode time at
+    // ~50-100ms per wait_queue call (3 calls per decode = ~150-300ms
+    // overhead per token); the WaitAny path is one suspend per call.
     bool done = false;
     ctx->queue.OnSubmittedWorkDone(
         wgpu::CallbackMode::AllowSpontaneous,
@@ -592,7 +599,9 @@ static void ggml_backend_webgpu_map_buffer(webgpu_global_context & ctx,
                                            size_t                  size) {
     ctx->get_tensor_map_status = wgpu::MapAsyncStatus::Error;
     ctx->get_tensor_map_message.clear();
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(GGML_WEBGPU_JSPI)
+    // ASYNCIFY-only polling path. JSPI uses WaitAny below — see the
+    // matching note in ggml_backend_webgpu_wait_queue.
     bool done = false;
     buffer.MapAsync(
         mode, offset, size, wgpu::CallbackMode::AllowSpontaneous,
