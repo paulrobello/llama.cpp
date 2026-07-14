@@ -765,13 +765,15 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
 
             wgpu::ComputePassEncoder pass = ctx->active_command_encoder.BeginComputePass(&pass_desc);
 
-        pass.SetPipeline(dispatches[i].pipeline.pipeline);
-        pass.SetBindGroup(0, bind_groups[i]);
-        pass.DispatchWorkgroups(dispatches[i].workgroups.first, dispatches[i].workgroups.second, 1);
-        pass.End();
-        result.pipeline_names.push_back(dispatches[i].pipeline.name);
+            pass.SetPipeline(dispatches[i].pipeline.pipeline);
+            pass.SetBindGroup(0, bind_groups[i]);
+            pass.DispatchWorkgroups(dispatches[i].workgroups.first, dispatches[i].workgroups.second, 1);
+            pass.End();
+            result.pipeline_names.push_back(dispatches[i].pipeline.name);
+        }
+        return result;
     }
-#else
+#endif
     for (size_t i = 0; i < dispatches.size(); i++) {
         if (ctx->batch_compute_passes) {
             ctx->active_compute_pass.SetPipeline(dispatches[i].pipeline.pipeline);
@@ -3594,7 +3596,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             // flush before the next batch can overflow the QuerySet
             if (ctx->profile_timestamp_query_count + 2 * ctx->global_ctx->command_submit_batch_size >=
                 WEBGPU_MAX_PROFILE_QUERY_COUNT) {
-                ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
+                ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches, &graph_profile);
                 // reset profile timestamp state
                 ctx->profile_timestamp_query_count = 0;
                 profile_pipeline_names.clear();
